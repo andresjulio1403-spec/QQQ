@@ -10,6 +10,15 @@ Versión consolidada en UN SOLO ARCHIVO de todo el proyecto QQQ. Combina:
                           con ~30 min de anticipación cuando el momentum de
                           corto plazo está por cambiar de signo
 
+FUENTE DE DATOS CON RESPALDO (FALLBACK)
+------------------------------------------
+Todas las descargas de precios intentan primero yfinance (Yahoo Finance).
+Si falla (error, datos vacíos, bloqueo/rate-limit típico de IPs compartidas
+como PythonAnywhere free), el script cae automáticamente a Stooq
+(https://stooq.com), una fuente gratuita sin API key. No requiere
+librerías adicionales, solo usa `requests` + `pandas` que ya están
+instalados. Se imprime en consola qué fuente se usó en cada intento.
+
 Cada sección funciona de forma independiente y se puede activar/desactivar
 con las banderas ACTIVAR_* de la configuración. Todas comparten el mismo
 bucle principal, cada una revisando en su propio intervalo.
@@ -30,7 +39,9 @@ script entrena el modelo automáticamente la primera vez que corre (tarda
 uno o dos minutos). Para reentrenar manualmente, borra ese archivo .pkl.
 """
 
+import io
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -120,17 +131,69 @@ def enviar_telegram(mensaje: str):
 
 
 # ============================================================
-# SECCIÓN 1 - BOT BÁSICO (SMA20 vs SMA50, diario)
+# FUENTE DE DATOS: yfinance con respaldo automático en Stooq
 # ============================================================
+_HEADERS_NAVEGADOR = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+
+
+def _periodo_a_dias(periodo: str) -> int:
+    """Convierte strings tipo '6mo', '1y', '5y', '5d' a una cantidad de días
+    aproximada, para poder armar el rango de fechas que le pide Stooq."""
+    m = re.match(r"^(\d+)(d|mo|y)$", periodo.strip())
+    if not m:
+        return 365
+    cantidad, unidad = int(m.group(1)), m.group(2)
+    dias_por_unidad = {"d": 1, "mo": 30, "y": 365}
+    return cantidad * dias_por_unidad[unidad]
+
+
+def _simbolo_stooq(ticker: str) -> str:
+    simbolo = ticker.lower()
+    if "." not in simbolo:
+        simbolo += ".us"  # los tickers de EE.UU. en Stooq llevan sufijo .us
+    return simbolo
+
+
+def _descargar_csv_stooq(url: str) -> pd.DataFrame:
+    resp = requests.get(url, headers=_HEADERS_NAVEGADOR, timeout=20)
+    resp.raise_for_status()
+    texto = resp.text
+    if not texto or texto.strip().lower().startswith("<") or "Date" not in texto.splitlines()[0]:
+        raise RuntimeError("Stooq no devolvió un CSV válido (posible símbolo inválido o bloqueo).")
+    return pd.read_csv(io.StringIO(texto))
+
+
+def obtener_datos_diarios_stooq(ticker: str, periodo: str = "6mo") -> pd.DataFrame:
+    simbolo = _simbolo_stooq(ticker)
+    dias = _periodo_a_dias(periodo)
+    fin = datetime.now()
+    inicio = fin - timedelta(days=dias)
+    url = f"https://stooq.com/q/d/l/?s={simbolo}&d1={inicio:%Y%m%d}&d2={fin:%Y%m%d}&i=d"
+
+    df = _descargar_csv_stooq(url)
+    if df.empty or "Close" not in df.columns:
+        raise RuntimeError(f"Stooq no devolvió datos diarios válidos para {ticker}")
+
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
 def obtener_datos_diarios(ticker: str, periodo: str = "6mo") -> pd.DataFrame:
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-    
-    t = yf.Ticker(ticker, session=session)
-    data = t.history(period=periodo)
-    if data.empty:
-        raise RuntimeError(f"No se pudieron obtener datos para {ticker}")
-    return data
+    """Intenta yfinance primero; si falla o devuelve vacío, cae a Stooq."""
+    try:
+        session = requests.Session()
+        session.headers.update(_HEADERS_NAVEGADOR)
+        data = yf.Ticker(ticker, session=session).history(period=periodo)
+        if data.empty:
+            raise RuntimeError("yfinance devolvió datos vacíos")
+        print(f"[DATOS] Diarios de {ticker} obtenidos de yfinance.")
+        return data
+    except Exception as e:
+        print(f"[DATOS] yfinance falló para datos diarios ({e}). Probando Stooq como respaldo...")
+        data = obtener_datos_diarios_stooq(ticker, periodo)
+        print(f"[DATOS] Diarios de {ticker} obtenidos de Stooq (respaldo).")
+        return data
 
 
 def calcular_tendencia_sma(data: pd.DataFrame):
@@ -327,20 +390,47 @@ def revisar_bot_predictivo(paquete: dict, estado: dict):
 # ============================================================
 # SECCIÓN 3 - ALERTA TEMPRANA INTRADÍA (velas de 10-15 min)
 # ============================================================
-def obtener_datos_intradia(ticker: str, horas: int, minutos_vela: int) -> pd.DataFrame:
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-    
-    t = yf.Ticker(ticker, session=session)
-    base = t.history(period="5d", interval="5m")
-    if base.empty:
-        raise RuntimeError(f"No se pudieron obtener datos intradía para {ticker}")
-    corte = base.index.max() - timedelta(hours=horas)
-    base = base[base.index >= corte]
-    agregado = base.resample(f"{minutos_vela}min", label="right", closed="right").agg({
+def _agregar_velas(base: pd.DataFrame, minutos_vela: int) -> pd.DataFrame:
+    return base.resample(f"{minutos_vela}min", label="right", closed="right").agg({
         "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum",
     }).dropna()
-    return agregado
+
+
+def obtener_datos_intradia_stooq(ticker: str, horas: int, minutos_vela: int) -> pd.DataFrame:
+    simbolo = _simbolo_stooq(ticker)
+    url = f"https://stooq.com/q/d/l/?s={simbolo}&i=5"  # Stooq da velas base de 5 min
+
+    df = _descargar_csv_stooq(url)
+    if df.empty or "Close" not in df.columns or "Time" not in df.columns:
+        raise RuntimeError(f"Stooq no devolvió datos intradía válidos para {ticker}")
+
+    df["Datetime"] = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str))
+    df = df.set_index("Datetime").sort_index()
+    base = df[["Open", "High", "Low", "Close", "Volume"]]
+
+    corte = base.index.max() - timedelta(hours=horas)
+    base = base[base.index >= corte]
+    return _agregar_velas(base, minutos_vela)
+
+
+def obtener_datos_intradia(ticker: str, horas: int, minutos_vela: int) -> pd.DataFrame:
+    """Intenta yfinance primero; si falla o devuelve vacío, cae a Stooq."""
+    try:
+        session = requests.Session()
+        session.headers.update(_HEADERS_NAVEGADOR)
+        base = yf.Ticker(ticker, session=session).history(period="5d", interval="5m")
+        if base.empty:
+            raise RuntimeError("yfinance devolvió datos intradía vacíos")
+        corte = base.index.max() - timedelta(hours=horas)
+        base = base[base.index >= corte]
+        agregado = _agregar_velas(base, minutos_vela)
+        print(f"[DATOS] Intradía de {ticker} obtenidos de yfinance.")
+        return agregado
+    except Exception as e:
+        print(f"[DATOS] yfinance falló para datos intradía ({e}). Probando Stooq como respaldo...")
+        agregado = obtener_datos_intradia_stooq(ticker, horas, minutos_vela)
+        print(f"[DATOS] Intradía de {ticker} obtenidos de Stooq (respaldo).")
+        return agregado
 
 
 def calcular_indicadores_intradia(df: pd.DataFrame) -> pd.DataFrame:
